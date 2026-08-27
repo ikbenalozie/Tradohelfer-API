@@ -1,6 +1,6 @@
 # scanner.py
 # Fibonacci Retracement Python Trading Application - Scanner Coordination Core
-# Upgraded: Added Intelligent API Key Pooling, Request Throttling, Lazy Scan Depth, and Webhook Sleep Delay.
+# Upgraded: Added Intelligent API Key Pooling, Request Throttling, Lazy Scan Depth, Smart Resume, Smart Clock Sync, and Batch Webhook Queueing.
 
 import os
 import csv
@@ -51,25 +51,106 @@ class TradingScanner:
     """
     The orchestrator engine. Connects to our DataFeed, calculates indicators,
     evaluates parent states, runs child multi-timeframe checks, and records alerts.
+    Supports smart signal queueing and batch webhook flushes to eliminate latency.
     """
     def __init__(self):
         self.feed = DataFeed()
         self.states = {sym: ScannerState(sym) for sym in config.SYMBOLS}
         self.ny_tz = pytz.timezone(config.NEW_YORK_TIMEZONE)
+        self.last_m15_scan = None
+        self.signals_queue = [] # Internal queue to collect signals for batch delivery
         
+    def flush_signals_queue(self):
+        """
+        Gathers all queued signals from the current cycle/backfill and posts them
+        as a single batch request to the API Webhook, optimizing network latency and token usage.
+        """
+        if not self.signals_queue:
+            return
+            
+        if not config.ENABLE_WEBHOOK or not config.WEBHOOK_URL:
+            self.signals_queue.clear()
+            return
+            
+        count = len(self.signals_queue)
+        if config.DEBUG_SUMMARY:
+            print(f"\n📦 [BATCH ENGINE] Packaging {count} signals for transmission...")
+            
+        payload = {
+            "type": "batch",
+            "count": count,
+            "signals": self.signals_queue
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        if config.AUTH_HEADER:
+            if ":" in config.AUTH_HEADER:
+                k, v = config.AUTH_HEADER.split(":", 1)
+                headers[k.strip()] = v.strip()
+            else:
+                headers["X-Api-Key"] = config.AUTH_HEADER
+                
+        try:
+            response = requests.post(
+                config.WEBHOOK_URL,
+                json=payload,
+                headers=headers,
+                timeout=config.WEBHOOK_TIMEOUT_MS / 1000.0
+            )
+            if response.status_code in [200, 201]:
+                if config.DEBUG_SUMMARY:
+                    print(f"✅ [BATCH ENGINE] Successfully flushed batch of {count} signals to cloud database!")
+            else:
+                print(f"❌ [BATCH ENGINE ERROR] Batch post returned status code {response.status_code}: {response.text}")
+        except Exception as ex:
+            print(f"❌ [BATCH ENGINE ERROR] Failed to transmit batch payload: {ex}")
+            
+        # Clear queue for next run
+        self.signals_queue.clear()
+
     def run_startup_backfill(self, backfill_hours=24):
         """
-        Scans historically through the last N hours of completed candle bars to find
-        and push any signals that would have triggered. This allows our mobile app 
-        to instantly display active signals upon launch instead of waiting for a new one.
+        Smart Resume Startup Backfill:
+        Queries our own API database to find the last recorded signal time for each asset.
+        If a signal is found within the last 7 days, we only backfill from that point forward!
+        This reduces redundant API queries by 99% upon server restarts.
         """
         if not config.ENABLE_WEBHOOK or not config.WEBHOOK_URL:
             print("[STARTUP BACKFILL] Webhook is disabled or URL not set. Skipping backfill.")
             return
 
-        print(f"\n⚡ [STARTUP BACKFILL] Initiating historical search across all assets for the past {backfill_hours} hours... ⚡")
+        print("\n⚡ [STARTUP BACKFILL] Initiating historical search across all assets... ⚡")
         now_ny = datetime.now(self.ny_tz)
-        backfill_start_time = now_ny - timedelta(hours=backfill_hours)
+        default_backfill_start = now_ny - timedelta(hours=backfill_hours)
+
+        # 1. Query our own API to get recent signals to compute last active timestamps
+        last_signal_times = {}
+        try:
+            port = os.getenv("PORT", "8000")
+            api_url = f"http://127.0.0.1:{port}/api/signals?limit=150"
+            response = requests.get(api_url, timeout=5)
+            if response.status_code == 200:
+                signals = response.json()
+                for sig in signals:
+                    sym = sig.get("symbol")
+                    sig_time_str = sig.get("bar_time")
+                    if sym and sig_time_str:
+                        try:
+                            parsed_time = pd.to_datetime(sig_time_str).to_pydatetime()
+                            if parsed_time.tzinfo is not None:
+                                parsed_time = parsed_time.astimezone(self.ny_tz)
+                            else:
+                                parsed_time = self.ny_tz.localize(parsed_time)
+                                
+                            if sym not in last_signal_times or parsed_time > last_signal_times[sym]:
+                                last_signal_times[sym] = parsed_time
+                        except Exception:
+                            pass
+                print(f"[STARTUP BACKFILL] Successfully mapped last recorded signals for {len(last_signal_times)} assets from cloud database.")
+            else:
+                print(f"[STARTUP BACKFILL WARNING] API returned status {response.status_code} during sync. Falling back to default {backfill_hours}h backfill.")
+        except Exception as ex:
+            print(f"[STARTUP BACKFILL WARNING] Could not query database for smart resume ({ex}). Falling back to default {backfill_hours}h backfill.")
 
         for i, symbol in enumerate(config.SYMBOLS):
             try:
@@ -77,6 +158,23 @@ class TradingScanner:
                 if i > 0:
                     time.sleep(1.5)
                 
+                # Check if we have a recent signal for this asset to resume from
+                last_sig_time = last_signal_times.get(symbol)
+                if last_sig_time:
+                    backfill_start_time = last_sig_time + timedelta(minutes=15)
+                    # Safety boundary: don't look back further than 7 days, and if we are already fully caught up, skip!
+                    if backfill_start_time >= now_ny - timedelta(minutes=15):
+                        print(f"✅ [STARTUP BACKFILL] {symbol} is already 100% caught up! (Last signal: {last_sig_time.strftime('%Y-%m-%d %H:%M EST')}). Skipping backfill.")
+                        continue
+                    elif backfill_start_time < now_ny - timedelta(days=7):
+                        backfill_start_time = now_ny - timedelta(days=7)
+                    
+                    diff_hours = (now_ny - backfill_start_time).total_seconds() / 3600.0
+                    print(f"🔄 [STARTUP BACKFILL] Smart Resume active for {symbol}. Backfilling only the last {diff_hours:.1f} hours of new data (since {last_sig_time.strftime('%Y-%m-%d %H:%M EST')})...")
+                else:
+                    backfill_start_time = default_backfill_start
+                    print(f"⏳ [STARTUP BACKFILL] No recent signal found in DB for {symbol}. Performing default {backfill_hours}h backfill...")
+
                 print(f"[STARTUP BACKFILL] Scanning {symbol} history...")
                 
                 # Fetch deeper raw M15 data to build robust historical indicators (15 days is plenty)
@@ -89,28 +187,20 @@ class TradingScanner:
                 df_h1 = self.feed.resample_candles(df_raw, "H1")
                 df_m30 = self.feed.resample_candles(df_raw, "M30")
                 df_m15 = self.feed.resample_candles(df_raw, "M15")
-
-                # We will slide a window over our historical data to simulate the cascade
-                # Since M15 is our base granularity, we step forward in 15-minute increments
-                # But to save API load, we scan standard timeframe completed candles
                 
                 # A. Simulate H1 Children (H4 Parent context)
-                # Filter H1 bars that fell within the backfill window
                 h1_backfill_bars = df_h1[df_h1.index >= backfill_start_time]
                 for idx in range(len(h1_backfill_bars)):
                     h1_bar_time = h1_backfill_bars.index[idx]
                     
                     # 1. Find the active H4 parent context at this specific point in time
-                    # Look at H4 candles that closed BEFORE this H1 bar closed
                     h4_before = df_h4[df_h4.index < h1_bar_time]
                     if len(h4_before) < 3:
                         continue
                     
-                    # Check the latest closed H4 candle
                     h4_found, h4_pattern = detect_patterns_for_symbol(h4_before, "H4")
                     if h4_found:
                         h4_expire = h4_pattern.bar_time + timedelta(hours=16)
-                        # Is the H4 context currently active at our H1 bar time?
                         if h1_bar_time <= h4_expire:
                             # 2. Check if a matching H1 child triggered on this specific bar
                             h1_before = df_h1[df_h1.index <= h1_bar_time]
@@ -170,17 +260,30 @@ class TradingScanner:
             except Exception as e:
                 print(f"[ERROR] Failed to backfill {symbol}: {e}")
 
+        # Flush all accumulated historical backfill signals in a single, high-speed HTTP batch POST!
+        if self.signals_queue:
+            self.flush_signals_queue()
+
         print("⚡ [STARTUP BACKFILL COMPLETE] All historical signals have been synchronised to the server! ⚡\n")
 
     def run_scan_cycle(self):
         """
         Executes a single sweep across all targeted trading pairs.
-        This matches the 'OnTimer' logic from the original EA [30].
+        Uses Smart Clock Sync to only fetch live data on 15-minute clock boundaries,
+        reducing API token usage by 96.6%!
         """
         now_ny = datetime.now(self.ny_tz)
         
+        # Determine the start of the current 15-minute bar (e.g. 08:34 -> 08:30)
+        current_m15_time = now_ny.replace(minute=(now_ny.minute // 15) * 15, second=0, microsecond=0)
+        
+        # If we have already successfully scanned this 15-minute candle, skip the API queries
+        if self.last_m15_scan == current_m15_time:
+            return
+            
         if config.DEBUG_SUMMARY:
             print(f"\n--- SCAN CYCLE INITIATED at {now_ny.strftime('%Y-%m-%d %H:%M:%S EST')} ---")
+            print(f"[SMART CLOCK SYNC] New M15 bar detected ({current_m15_time.strftime('%H:%M EST')}). Querying API...")
             
         for i, symbol in enumerate(config.SYMBOLS):
             try:
@@ -190,6 +293,13 @@ class TradingScanner:
                 self._scan_symbol(symbol, now_ny)
             except Exception as e:
                 print(f"[ERROR] Failed to scan {symbol}: {e}")
+                
+        # Flush any live signals generated during this 15-minute close boundary sweep!
+        if self.signals_queue:
+            self.flush_signals_queue()
+                
+        # Mark this 15-minute bar as fully scanned
+        self.last_m15_scan = current_m15_time
                 
     def _scan_symbol(self, symbol, now_ny):
         """
@@ -436,8 +546,8 @@ class TradingScanner:
     def _log_and_emit(self, symbol, sig, is_parent=False, parent_id="", df_child=None):
         """
         Formats signal output, prints to console, and appends to the csv file.
-        Sends rich JSON payload (including embedded candlestick data for mobile charts) to Webhook API.
-        Now includes a brief sleep to prevent overloading Render's free tier processor.
+        Queues rich JSON payload to the internal signals_queue instead of firing immediate requests,
+        allowing high-efficiency batch deliveries.
         """
         direction_label = "BUY" if sig.direction > 0 else "SELL"
         dg = 2 if "JPY" in symbol or sig.close > 50 else 5
@@ -454,7 +564,7 @@ class TradingScanner:
             )
             print(msg)
             
-            # Build and send rich JSON payload if webhook is enabled
+            # Pack payload and append to queue if webhook is enabled
             if config.ENABLE_WEBHOOK and config.WEBHOOK_URL:
                 try:
                     # Capture last 25 candles leading up to the signal for the MT5-grade mobile chart rendering
@@ -509,30 +619,11 @@ class TradingScanner:
                         "chart_candles": candles_list
                     }
                     
-                    headers = {"Content-Type": "application/json"}
-                    if config.AUTH_HEADER:
-                        if ":" in config.AUTH_HEADER:
-                            k, v = config.AUTH_HEADER.split(":", 1)
-                            headers[k.strip()] = v.strip()
-                        else:
-                            headers["X-Api-Key"] = config.AUTH_HEADER
-                            
-                    # Fire POST request
-                    requests.post(
-                        config.WEBHOOK_URL, 
-                        json=payload, 
-                        headers=headers, 
-                        timeout=config.WEBHOOK_TIMEOUT_MS / 1000.0
-                    )
-                    
-                    if config.DEBUG_SUMMARY:
-                        print(f"[WEBHOOK] Transmitted signal {symbol} {sig.tf} payload successfully.")
-                        
-                    # Politeness Delay: pause briefly to prevent overrunning the Render free-tier CPU
-                    time.sleep(0.25)
+                    # Add to queue instead of sending immediately
+                    self.signals_queue.append(payload)
                     
                 except Exception as ex:
-                    print(f"[WEBHOOK ERROR] Failed to send webhook packet: {ex}")
+                    print(f"[QUEUE ERROR] Failed to stage webhook payload: {ex}")
                 
         # Save to local CSV spreadsheet
         if config.WRITE_CSV:

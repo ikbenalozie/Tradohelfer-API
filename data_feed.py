@@ -1,7 +1,7 @@
-# data_feed.py
-# Fibonacci Retracement Python Trading Application - Timezone Aware Data Feed with API Key Pooling
+# data_feed-v6.py
+# Fibonacci Retracement Python Trading Application - Timezone Aware Data Feed with API Key Pooling & Dual Fallback
 # This module connects to our data source (Tiingo) with multi-key rotation and caching
-# or generates realistic, high-quality mock data if no key is present.
+# or falls back to Twelve Data / Yahoo Finance / Coinbase Public APIs if rate limits are hit.
 
 import time
 import requests
@@ -15,7 +15,7 @@ class DataFeed:
     """
     DataFeed acts as our 'Ear to the Ground'. It fetches raw market data and organizes it 
     into structured pandas DataFrames. Enforces the True New York Close (17:00 Close) standard.
-    Now supports an API Key Pool to distribute load and bypass rate limits!
+    Now supports an API Key Pool and dynamic dual-provider fallbacks!
     """
     
     def __init__(self):
@@ -75,15 +75,25 @@ class DataFeed:
 
     def fetch_raw_data(self, symbol, timeframe="15min", days=30):
         """
-        Fetches historical candle data. Rotates through keys if rate limits are hit.
+        Fetches historical candle data. Rotates through keys or fallbacks if rate limits are hit.
         """
         sym_lower = symbol.lower()
+        
+        # Crypto Optimization: Coinbase has 100% free, unlimited, key-less data for BTCUSD
+        if symbol == "BTCUSD":
+            cb_df = self._fetch_from_coinbase_free(symbol, timeframe, days)
+            if cb_df is not None and not cb_df.empty:
+                return cb_df
+
         active_key = self._get_active_api_key()
         
         # Checking if API key pool is empty
         if not active_key:
             if config.DEBUG_SUMMARY:
-                print(f"[DATA FEED] No active Tiingo API keys found in pool. Generating true-to-life offline data for {symbol}...")
+                print(f"[DATA FEED] No active Tiingo API keys found in pool. Checking fallbacks for {symbol}...")
+            fallback_df = self._fetch_from_fallback_chain(symbol, timeframe, days)
+            if fallback_df is not None and not fallback_df.empty:
+                return fallback_df
             return self._generate_mock_data(symbol, timeframe, days)
         
         url = f"https://api.tiingo.com/tiingo/fx/{sym_lower}/prices"
@@ -107,7 +117,6 @@ class DataFeed:
         retry_delay = 1.5  # initial sleep duration in seconds
         
         for attempt in range(max_retries):
-            # Refresh active key on retry
             if attempt > 0:
                 active_key = self._get_active_api_key()
                 
@@ -128,13 +137,11 @@ class DataFeed:
                 if response.status_code == 429:
                     self._mark_key_as_cooldown(active_key)
                     
-                    # If we have multiple keys, try another key immediately without waiting!
                     if len(self.api_keys) > 1:
                         if config.DEBUG_SUMMARY:
                             print(f"[API KEY POOL] Swapping to another key in pool immediately...")
                         continue
                         
-                    # If we only have 1 key, we must sleep
                     if config.DEBUG_SUMMARY:
                         print(f"[DATA FEED WARNING] Rate limit hit (429) for {symbol}. "
                               f"Retrying in {retry_delay:.1f}s (Attempt {attempt + 1}/{max_retries})...")
@@ -166,23 +173,197 @@ class DataFeed:
                     return df[['Open', 'High', 'Low', 'Close']]
                 else:
                     if config.DEBUG_SUMMARY:
-                        print(f"[DATA FEED WARNING] API request failed with status code {response.status_code} for {symbol}. Using fallback mock data...")
+                        print(f"[DATA FEED WARNING] API request failed with status {response.status_code} for {symbol}. Trying fallbacks...")
+                    fallback_df = self._fetch_from_fallback_chain(symbol, timeframe, days)
+                    if fallback_df is not None and not fallback_df.empty:
+                        return fallback_df
                     return self._generate_mock_data(symbol, timeframe, days)
                     
             except Exception as e:
                 if config.DEBUG_SUMMARY:
-                    print(f"[DATA FEED WARNING] Error reaching API ({e}) for {symbol}. Using fallback mock data...")
+                    print(f"[DATA FEED WARNING] Error reaching API ({e}) for {symbol}. Trying fallbacks...")
+                fallback_df = self._fetch_from_fallback_chain(symbol, timeframe, days)
+                if fallback_df is not None and not fallback_df.empty:
+                    return fallback_df
                 return self._generate_mock_data(symbol, timeframe, days)
                 
         # If all retries were exhausted
         if config.DEBUG_SUMMARY:
-            print(f"[DATA FEED WARNING] Rate limit retry limit exhausted for {symbol}. Using fallback mock data...")
+            print(f"[DATA FEED WARNING] Rate limit retry limit exhausted for {symbol}. Trying fallbacks...")
+        fallback_df = self._fetch_from_fallback_chain(symbol, timeframe, days)
+        if fallback_df is not None and not fallback_df.empty:
+            return fallback_df
         return self._generate_mock_data(symbol, timeframe, days)
+
+    def _fetch_from_fallback_chain(self, symbol, timeframe, days):
+        """
+        Chains fallback providers together to ensure 100% uptime.
+        """
+        # Fallback 1: Twelve Data API (Extremely generous, simple free key)
+        twelve_df = self._fetch_from_twelvedata(symbol, timeframe, days)
+        if twelve_df is not None and not twelve_df.empty:
+            return twelve_df
             
+        # Fallback 2: Yahoo Finance API
+        yf_df = self._fetch_from_yfinance(symbol, timeframe, days)
+        if yf_df is not None and not yf_df.empty:
+            return yf_df
+            
+        return None
+
+    def _fetch_from_coinbase_free(self, symbol, timeframe, days):
+        """
+        Fetches BTCUSD historical candles from Coinbase Pro Public API.
+        This is 100% free, require no keys, and has very generous rate limits!
+        """
+        try:
+            if config.DEBUG_SUMMARY:
+                print(f"[CRYPTO BOOSTER] Fetching BTCUSD directly from Coinbase Pro public REST API...")
+            # Coinbase uses intervals in seconds: 900 (15m), 1800 (30m), 3600 (1h), 21600 (4h), 86400 (1D)
+            granularity = 900
+            if timeframe in ["M30", "30min"]: granularity = 1800
+            elif timeframe in ["H1", "1hour"]: granularity = 3600
+            elif timeframe in ["H4", "4hour"]: granularity = 21600
+            elif timeframe in ["1D", "1day"]: granularity = 86400
+            
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(days=days)
+            
+            url = "https://api.pro.coinbase.com/products/BTC-USD/candles"
+            params = {
+                "start": start_time.isoformat(),
+                "end": end_time.isoformat(),
+                "granularity": granularity
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                # Format: [ [time, low, high, open, close, volume], ... ]
+                df = pd.DataFrame(data, columns=['time', 'Low', 'High', 'Open', 'Close', 'Volume'])
+                df['datetime'] = pd.to_datetime(df['time'], unit='s')
+                df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert(self.ny_tz)
+                df.set_index('datetime', inplace=True)
+                df.sort_index(inplace=True)
+                return df[['Open', 'High', 'Low', 'Close']]
+        except Exception as e:
+            if config.DEBUG_SUMMARY:
+                print(f"[CRYPTO BOOSTER WARNING] Coinbase query failed: {e}")
+        return None
+
+    def _fetch_from_twelvedata(self, symbol, timeframe, days):
+        """
+        Fetches from Twelve Data (very generous free tier, handles Forex and Cryptos perfectly).
+        """
+        # Format FX symbols: EURUSD -> EUR/USD
+        formatted_sym = symbol
+        if len(symbol) == 6 and symbol.isupper() and symbol not in ["XAUUSD", "XAGUSD", "USOUSD"]:
+            formatted_sym = f"{symbol[:3]}/{symbol[3:]}"
+        elif symbol in ["XAUUSD", "XAU"]:
+            formatted_sym = "XAU/USD"
+        elif symbol in ["XAGUSD", "XAG"]:
+            formatted_sym = "XAG/USD"
+            
+        interval = "15min"
+        if timeframe in ["M30", "30min"]: interval = "30min"
+        elif timeframe in ["H1", "1hour"]: interval = "1h"
+        elif timeframe in ["H4", "4hour"]: interval = "4h"
+        elif timeframe in ["1D", "1day"]: interval = "1day"
+        
+        # We can use a public fallback key or let user override in config if they register for free
+        td_key = getattr(config, "TWELVEDATA_API_KEY", "demo")
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": formatted_sym,
+            "interval": interval,
+            "outputsize": min(5000, days * 96), # Get enough candles to represent 'days'
+            "apikey": td_key
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if "values" in data:
+                    df = pd.DataFrame(data["values"])
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.rename(columns={
+                        'open': 'Open',
+                        'high': 'High',
+                        'low': 'Low',
+                        'close': 'Close'
+                    }, inplace=True)
+                    df = df.astype({'Open': float, 'High': float, 'Low': float, 'Close': float})
+                    df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert(self.ny_tz)
+                    df.set_index('datetime', inplace=True)
+                    df.sort_index(inplace=True)
+                    return df[['Open', 'High', 'Low', 'Close']]
+        except Exception as e:
+            if config.DEBUG_SUMMARY:
+                print(f"[FALLBACK WARNING] Twelve Data query failed for {symbol}: {e}")
+        return None
+
+    def _fetch_from_yfinance(self, symbol, timeframe, days):
+        """
+        Fetches from Yahoo Finance REST API.
+        """
+        if symbol == "BTCUSD":
+            yf_ticker = "BTC-USD"
+        elif symbol in ["XAUUSD", "XAU"]:
+            yf_ticker = "XAUUSD=X"
+        elif symbol in ["XAGUSD", "XAG"]:
+            yf_ticker = "XAGUSD=X"
+        elif symbol in ["USOUSD", "USO"]:
+            yf_ticker = "CL=F"
+        else:
+            yf_ticker = f"{symbol}=X"
+            
+        interval = "15m"
+        if timeframe in ["M15", "15min"]: interval = "15m"
+        elif timeframe in ["M30", "30min"]: interval = "30m"
+        elif timeframe in ["H1", "1hour"]: interval = "60m"
+        elif timeframe in ["H4", "4hour"]: interval = "1h"
+        elif timeframe in ["1D", "1day"]: interval = "1d"
+        
+        range_str = f"{days}d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_ticker}"
+        params = {
+            "interval": interval,
+            "range": range_str
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+        }
+        
+        try:
+            if config.DEBUG_SUMMARY:
+                print(f"[FALLBACK COOPERATION] Fetching {symbol} via Yahoo Finance fallback...")
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                result = data['chart']['result'][0]
+                timestamps = result['timestamp']
+                quotes = result['indicators']['quote'][0]
+                
+                df = pd.DataFrame({
+                    'Open': quotes['open'],
+                    'High': quotes['high'],
+                    'Low': quotes['low'],
+                    'Close': quotes['close']
+                }, index=pd.to_datetime(timestamps, unit='s'))
+                
+                df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
+                df.index = df.index.tz_localize('UTC').dt.tz_convert(self.ny_tz) if hasattr(df.index, 'dt') else df.index.tz_localize('UTC').tz_convert(self.ny_tz)
+                df.index.name = 'datetime'
+                return df[['Open', 'High', 'Low', 'Close']]
+        except Exception as e:
+            if config.DEBUG_SUMMARY:
+                print(f"[FALLBACK WARNING] Yahoo Finance query failed for {symbol}: {e}")
+        return None
+
     def _generate_mock_data(self, symbol, timeframe, days):
         """
-        Generates mathematically robust, high-quality synthetic candles.
-        Weekend gaps removed to mimic true Forex markets with exact New York timestamps.
+        Fallback generator.
         """
         freq_minutes = 15
         if timeframe in ["M15", "15min"]: freq_minutes = 15
@@ -204,11 +385,11 @@ class DataFeed:
             hour = curr.hour
             
             is_weekend = False
-            if day_of_week == 5: # Saturday
+            if day_of_week == 5:
                 is_weekend = True
-            elif day_of_week == 4 and hour >= 17: # Friday post-close
+            elif day_of_week == 4 and hour >= 17:
                 is_weekend = True
-            elif day_of_week == 6 and hour < 17: # Sunday pre-open
+            elif day_of_week == 6 and hour < 17:
                 is_weekend = True
                 
             if not is_weekend:
@@ -231,11 +412,7 @@ class DataFeed:
         returns = np.random.normal(loc=0.0, scale=volatility, size=len(times))
         prices = base_price * np.exp(np.cumsum(returns))
         
-        opens = []
-        highs = []
-        lows = []
-        closes = []
-        
+        opens, highs, lows, closes = [], [], [], []
         last_close = base_price
         for i in range(len(times)):
             op = last_close
@@ -287,51 +464,31 @@ class DataFeed:
         return df
 
     def resample_candles(self, df_raw, interval="1D"):
-        """
-        Resamples raw sub-candles (e.g., 15-minute bars) to larger timeframes.
-        """
         if df_raw.empty:
             return df_raw
-            
         if not isinstance(df_raw.index, pd.DatetimeIndex):
             df_raw.index = pd.to_datetime(df_raw.index)
-            
         offset_rule = "17h"
         
         if interval == "1D":
             resampled = df_raw.resample('24h', offset=offset_rule).agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last'
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
         elif interval == "H4":
             resampled = df_raw.resample('4h', offset=offset_rule).agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last'
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
         elif interval == "H1":
             resampled = df_raw.resample('1h').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last'
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
         elif interval == "M30":
             resampled = df_raw.resample('30min').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last'
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
         elif interval == "M15":
             resampled = df_raw.resample('15min').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last'
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
             }).dropna()
         else:
             raise ValueError(f"Unsupported resampling interval: {interval}")

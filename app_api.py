@@ -1,4 +1,4 @@
-# app_api.py (Upgraded Version with Self-Healing Port Router and Memory Monitor)
+# app_api.py (Unified Batch-Capable Version with Self-Healing Port Router and Memory Monitor)
 # 100% Free-Tier Unified Backend for Fibonacci Retracement Trading Application
 # This file combines the FastAPI server AND the Python scanner into a single service,
 # allowing you to run your entire trading application on Render's FREE Web Service tier!
@@ -8,7 +8,7 @@ import json
 import sqlite3
 import threading
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, status
@@ -17,8 +17,8 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="Gemini Notebook Free-Tier Trading App",
-    description="Unified API & Background Scanner running on a single free web service instance with memory tracking.",
-    version="2.2.0"
+    description="Unified API & Background Scanner running on a single free web service instance with memory tracking and batch-webhook processing.",
+    version="2.3.0"
 )
 
 # Enable CORS (Cross-Origin Resource Sharing)
@@ -149,6 +149,11 @@ class SignalPayload(BaseModel):
     zones: Zones
     chart_candles: List[Candle]
 
+class BatchPayload(BaseModel):
+    type: str  # e.g., "batch"
+    count: int
+    signals: List[SignalPayload]
+
 # =====================================================================
 # SECURITY DEPENDENCY
 # =====================================================================
@@ -211,54 +216,80 @@ def get_health():
     }
 
 @app.post("/webhook", status_code=status.HTTP_201_CREATED)
-def receive_webhook(payload: SignalPayload, auth: str = Depends(verify_api_key)):
+def receive_webhook(payload: Union[SignalPayload, BatchPayload], auth: str = Depends(verify_api_key)):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Deduplication Guard
-        cursor.execute("""
-            SELECT id FROM signals 
-            WHERE symbol = ? AND tf = ? AND pattern = ? AND bar_time = ?
-        """, (payload.symbol, payload.tf, payload.pattern, payload.bar_time))
-        
-        if cursor.fetchone():
-            conn.close()
-            return {"success": True, "message": "Duplicate signal ignored."}
+        # Determine if payload is single signal or batch
+        if isinstance(payload, BatchPayload) or (hasattr(payload, "type") and payload.type == "batch"):
+            signals_list = payload.signals
+            is_batch = True
+        else:
+            signals_list = [payload]
+            is_batch = False
             
-        cursor.execute("""
-            INSERT INTO signals (
-                symbol, tf, pattern, dir, bar_time, open, high, low, close,
-                entry1, entry2, sl, tp1, tp2, tp1_swing, tp2_swing,
-                confidence, reasons, parent_id, zones, chart_candles, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            payload.symbol,
-            payload.tf,
-            payload.pattern,
-            payload.dir,
-            payload.bar_time,
-            payload.open,
-            payload.high,
-            payload.low,
-            payload.close,
-            payload.entry1,
-            payload.entry2,
-            payload.sl,
-            payload.tp1,
-            payload.tp2,
-            payload.tp1_swing,
-            payload.tp2_swing,
-            payload.confidence,
-            payload.reasons,
-            payload.parent_id,
-            json.dumps(payload.zones.dict()),
-            json.dumps([c.dict() for c in payload.chart_candles]),
-            datetime.utcnow().isoformat() + "Z"
-        ))
+        inserted_count = 0
+        duplicate_count = 0
+        
+        # Single database transaction for lightning-speed commits
+        for sig in signals_list:
+            # Deduplication Guard
+            cursor.execute("""
+                SELECT id FROM signals 
+                WHERE symbol = ? AND tf = ? AND pattern = ? AND bar_time = ?
+            """, (sig.symbol, sig.tf, sig.pattern, sig.bar_time))
+            
+            if cursor.fetchone():
+                duplicate_count += 1
+                continue
+                
+            cursor.execute("""
+                INSERT INTO signals (
+                    symbol, tf, pattern, dir, bar_time, open, high, low, close,
+                    entry1, entry2, sl, tp1, tp2, tp1_swing, tp2_swing,
+                    confidence, reasons, parent_id, zones, chart_candles, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                sig.symbol,
+                sig.tf,
+                sig.pattern,
+                sig.dir,
+                sig.bar_time,
+                sig.open,
+                sig.high,
+                sig.low,
+                sig.close,
+                sig.entry1,
+                sig.entry2,
+                sig.sl,
+                sig.tp1,
+                sig.tp2,
+                sig.tp1_swing,
+                sig.tp2_swing,
+                sig.confidence,
+                sig.reasons,
+                sig.parent_id,
+                json.dumps(sig.zones.dict()),
+                json.dumps([c.dict() for c in sig.chart_candles]),
+                datetime.utcnow().isoformat() + "Z"
+            ))
+            inserted_count += 1
+            
         conn.commit()
         conn.close()
-        return {"success": True, "message": f"Signal received for {payload.symbol} {payload.tf}."}
+        
+        if is_batch:
+            return {
+                "success": True, 
+                "message": f"Successfully processed batch payload. Signals Inserted: {inserted_count}, Duplicates Ignored: {duplicate_count}."
+            }
+        else:
+            if inserted_count > 0:
+                return {"success": True, "message": f"Signal received for {payload.symbol} {payload.tf}."}
+            else:
+                return {"success": True, "message": "Duplicate signal ignored."}
+                
     except Exception as ex:
         raise HTTPException(status_code=500, detail=f"Database error: {ex}")
 
