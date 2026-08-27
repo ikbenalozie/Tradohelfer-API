@@ -1,12 +1,11 @@
 # scanner.py
 # Fibonacci Retracement Python Trading Application - Scanner Coordination Core
-# This module maintains the state of each symbol, tracks parent active windows, 
-# scores children signals using the Multi-Timeframe Scoring Matrix, and outputs results.
-# Upgraded: Added 24-hour historical Startup Backfill Mode for preloading the mobile application charts.
+# Upgraded: Added Intelligent API Key Pooling, Request Throttling, Lazy Scan Depth, and Webhook Sleep Delay.
 
 import os
 import csv
 import json
+import time
 from datetime import datetime, timedelta
 import pytz
 import pandas as pd
@@ -24,12 +23,12 @@ from patterns import detect_patterns_for_symbol, PatternSignal
 
 class ScannerState:
     """
-    Keeps track of active parent windows and direction state for a single symbol [6, 31, 32].
+    Keeps track of active parent windows and direction state for a single symbol.
     """
     def __init__(self, symbol):
         self.symbol = symbol
         
-        # H4 Parent State (Controls H1 Children) [6, 9, 31, 32]
+        # H4 Parent State (Controls H1 Children)
         self.h4_dir = 0           # +1 for Buy bias, -1 for Sell bias, 0 for neutral
         self.h4_time = None       # Start time of triggering H4 bar
         self.h4_expire = None     # Expiration of active H4 context (H4 time + 16 hrs)
@@ -58,107 +57,124 @@ class TradingScanner:
         self.states = {sym: ScannerState(sym) for sym in config.SYMBOLS}
         self.ny_tz = pytz.timezone(config.NEW_YORK_TIMEZONE)
         
-        # Run startup backfill to populate past signals in the cloud database immediately
-        self.perform_startup_backfill()
-        
-    def perform_startup_backfill(self):
+    def run_startup_backfill(self, backfill_hours=24):
         """
-        Scans all symbols historically for signals triggered in the past N hours
-        and writes them to the SQLite database via webhook.
-        This ensures the mobile application has historical alerts immediately on launch!
+        Scans historically through the last N hours of completed candle bars to find
+        and push any signals that would have triggered. This allows our mobile app 
+        to instantly display active signals upon launch instead of waiting for a new one.
         """
-        backfill_hours = getattr(config, 'BACKFILL_HOURS', 24)
-        if backfill_hours <= 0:
-            return
-            
-        print(f"\n⚡ [STARTUP BACKFILL] Initiating historical search across all assets for the past {backfill_hours} hours... ⚡")
         if not config.ENABLE_WEBHOOK or not config.WEBHOOK_URL:
             print("[STARTUP BACKFILL] Webhook is disabled or URL not set. Skipping backfill.")
             return
-            
+
+        print(f"\n⚡ [STARTUP BACKFILL] Initiating historical search across all assets for the past {backfill_hours} hours... ⚡")
         now_ny = datetime.now(self.ny_tz)
-        cutoff_time = now_ny - timedelta(hours=backfill_hours)
-        
-        for symbol in config.SYMBOLS:
+        backfill_start_time = now_ny - timedelta(hours=backfill_hours)
+
+        for i, symbol in enumerate(config.SYMBOLS):
             try:
-                print(f"[STARTUP BACKFILL] Scanning {symbol}...")
-                df_raw = self.feed.fetch_raw_data(symbol, timeframe="M15", days=30)
+                # Politeness delay to prevent rate-limiting during historical data fetch
+                if i > 0:
+                    time.sleep(1.5)
+                
+                print(f"[STARTUP BACKFILL] Scanning {symbol} history...")
+                
+                # Fetch deeper raw M15 data to build robust historical indicators (15 days is plenty)
+                df_raw = self.feed.fetch_raw_data(symbol, timeframe="M15", days=15)
                 if df_raw.empty or len(df_raw) < 100:
                     continue
-                    
+
+                # Resample standard timeframes
                 df_h4 = self.feed.resample_candles(df_raw, "H4")
                 df_h1 = self.feed.resample_candles(df_raw, "H1")
                 df_m30 = self.feed.resample_candles(df_raw, "M30")
                 df_m15 = self.feed.resample_candles(df_raw, "M15")
+
+                # We will slide a window over our historical data to simulate the cascade
+                # Since M15 is our base granularity, we step forward in 15-minute increments
+                # But to save API load, we scan standard timeframe completed candles
                 
-                # Pre-calculate parent pattern timelines across 30 days
-                h4_parents = self._precalculate_parent_patterns(symbol, df_h4, "H4")
-                h1_parents = self._precalculate_parent_patterns(symbol, df_h1, "H1")
-                m30_parents = self._precalculate_parent_patterns(symbol, df_m30, "M30")
-                
-                # Check child timeframes
-                self._backfill_child_tf(symbol, df_h1, df_h4, h4_parents, "H1", "H4", cutoff_time)
-                self._backfill_child_tf(symbol, df_m30, df_h1, h1_parents, "M30", "H1", cutoff_time)
-                self._backfill_child_tf(symbol, df_m15, df_m30, m30_parents, "M15", "M30", cutoff_time)
-                
+                # A. Simulate H1 Children (H4 Parent context)
+                # Filter H1 bars that fell within the backfill window
+                h1_backfill_bars = df_h1[df_h1.index >= backfill_start_time]
+                for idx in range(len(h1_backfill_bars)):
+                    h1_bar_time = h1_backfill_bars.index[idx]
+                    
+                    # 1. Find the active H4 parent context at this specific point in time
+                    # Look at H4 candles that closed BEFORE this H1 bar closed
+                    h4_before = df_h4[df_h4.index < h1_bar_time]
+                    if len(h4_before) < 3:
+                        continue
+                    
+                    # Check the latest closed H4 candle
+                    h4_found, h4_pattern = detect_patterns_for_symbol(h4_before, "H4")
+                    if h4_found:
+                        h4_expire = h4_pattern.bar_time + timedelta(hours=16)
+                        # Is the H4 context currently active at our H1 bar time?
+                        if h1_bar_time <= h4_expire:
+                            # 2. Check if a matching H1 child triggered on this specific bar
+                            h1_before = df_h1[df_h1.index <= h1_bar_time]
+                            child_found, child_pattern = detect_patterns_for_symbol(h1_before, "H1")
+                            
+                            if child_found and child_pattern.direction == h4_pattern.direction:
+                                parent_id = f"{symbol}-H4-{int(h4_pattern.bar_time.timestamp())}-{h4_pattern.name}"
+                                self._evaluate_and_trigger_child_historical(
+                                    symbol=symbol, child_sig=child_pattern, parent_id=parent_id,
+                                    df_child=h1_before, df_parent=h4_before
+                                )
+
+                # B. Simulate M30 Children (H1 Parent context)
+                m30_backfill_bars = df_m30[df_m30.index >= backfill_start_time]
+                for idx in range(len(m30_backfill_bars)):
+                    m30_bar_time = m30_backfill_bars.index[idx]
+                    
+                    h1_before = df_h1[df_h1.index < m30_bar_time]
+                    if len(h1_before) < 3:
+                        continue
+                        
+                    h1_found, h1_pattern = detect_patterns_for_symbol(h1_before, "H1")
+                    if h1_found:
+                        h1_expire = h1_pattern.bar_time + timedelta(hours=4)
+                        if m30_bar_time <= h1_expire:
+                            m30_before = df_m30[df_m30.index <= m30_bar_time]
+                            child_found, child_pattern = detect_patterns_for_symbol(m30_before, "M30")
+                            if child_found and child_pattern.direction == h1_pattern.direction:
+                                parent_id = f"{symbol}-H1-{int(h1_pattern.bar_time.timestamp())}-{h1_pattern.name}"
+                                self._evaluate_and_trigger_child_historical(
+                                    symbol=symbol, child_sig=child_pattern, parent_id=parent_id,
+                                    df_child=m30_before, df_parent=h1_before
+                                )
+
+                # C. Simulate M15 Children (M30 Parent context)
+                m15_backfill_bars = df_m15[df_m15.index >= backfill_start_time]
+                for idx in range(len(m15_backfill_bars)):
+                    m15_bar_time = m15_backfill_bars.index[idx]
+                    
+                    m30_before = df_m30[df_m30.index < m15_bar_time]
+                    if len(m30_before) < 3:
+                        continue
+                        
+                    m30_found, m30_pattern = detect_patterns_for_symbol(m30_before, "M30")
+                    if m30_found:
+                        m30_expire = m30_pattern.bar_time + timedelta(hours=2)
+                        if m15_bar_time <= m30_expire:
+                            m15_before = df_m15[df_m15.index <= m15_bar_time]
+                            child_found, child_pattern = detect_patterns_for_symbol(m15_before, "M15")
+                            if child_found and child_pattern.direction == m30_pattern.direction:
+                                parent_id = f"{symbol}-M30-{int(m30_pattern.bar_time.timestamp())}-{m30_pattern.name}"
+                                self._evaluate_and_trigger_child_historical(
+                                    symbol=symbol, child_sig=child_pattern, parent_id=parent_id,
+                                    df_child=m15_before, df_parent=m30_before
+                                )
+
             except Exception as e:
-                print(f"[STARTUP BACKFILL ERROR] Failed to backfill {symbol}: {e}")
+                print(f"[ERROR] Failed to backfill {symbol}: {e}")
+
         print("⚡ [STARTUP BACKFILL COMPLETE] All historical signals have been synchronised to the server! ⚡\n")
 
-    def _precalculate_parent_patterns(self, symbol, df_parent, tf):
-        parent_signals = []
-        atr_series = calculate_atr(df_parent)
-        for j in range(20, len(df_parent)):
-            slice_df = df_parent.iloc[:j+1]
-            found, pattern = detect_patterns_for_symbol(slice_df, tf, atr_series.iloc[:j+1])
-            if found:
-                tf_hours = 4 if "H4" in tf else (1 if "H1" in tf else 0.5)
-                expire_time = pattern.bar_time + timedelta(hours=4 * tf_hours)
-                pattern_id = f"{symbol}-{tf}-{int(pattern.bar_time.timestamp())}-{pattern.name}"
-                parent_signals.append({
-                    "direction": pattern.direction,
-                    "bar_time": pattern.bar_time,
-                    "expire": expire_time,
-                    "id": pattern_id,
-                    "name": pattern.name
-                })
-        return parent_signals
-
-    def _backfill_child_tf(self, symbol, df_child, df_parent, parent_patterns, child_tf, parent_tf, cutoff_time):
-        atr_child = calculate_atr(df_child)
-        for i in range(50, len(df_child) - 1):
-            child_time = df_child.index[i]
-            if child_time < cutoff_time:
-                continue
-                
-            active_parent = None
-            for p in parent_patterns:
-                if p["bar_time"] <= child_time <= p["expire"]:
-                    active_parent = p
-                    break
-                    
-            if active_parent:
-                child_slice = df_child.iloc[:i+2]
-                child_found, child_pattern = detect_patterns_for_symbol(child_slice, child_tf, atr_child.iloc[:i+2])
-                
-                if child_found and child_pattern.direction == active_parent["direction"]:
-                    # We have a matching historical signal! Run evaluations and trigger
-                    df_parent_sliced = df_parent[df_parent.index <= child_time]
-                    self._evaluate_and_trigger_child(
-                        symbol=symbol,
-                        child_sig=child_pattern,
-                        parent_id=active_parent["id"],
-                        parent_dir=active_parent["direction"],
-                        df_child=child_slice,
-                        df_parent=df_parent_sliced,
-                        child_tf=child_tf,
-                        parent_tf=parent_tf,
-                        is_backfill=True
-                    )
-        
     def run_scan_cycle(self):
         """
-        Executes a single sweep across all targeted trading pairs [30].
+        Executes a single sweep across all targeted trading pairs.
         This matches the 'OnTimer' logic from the original EA [30].
         """
         now_ny = datetime.now(self.ny_tz)
@@ -166,49 +182,47 @@ class TradingScanner:
         if config.DEBUG_SUMMARY:
             print(f"\n--- SCAN CYCLE INITIATED at {now_ny.strftime('%Y-%m-%d %H:%M:%S EST')} ---")
             
-        for symbol in config.SYMBOLS:
+        for i, symbol in enumerate(config.SYMBOLS):
             try:
+                # Add a 1.5-second politeness delay to respect Tiingo's rate limit
+                if i > 0:
+                    time.sleep(1.5)
                 self._scan_symbol(symbol, now_ny)
             except Exception as e:
                 print(f"[ERROR] Failed to scan {symbol}: {e}")
                 
     def _scan_symbol(self, symbol, now_ny):
         """
-        Core scanning steps for a single asset:
-        1. Fetch raw sub-candles (M15 is our base granularity)
-        2. Resample raw bars into New York Close-aligned higher timeframes: 1D, H4, H1, M30, M15 [2]
-        3. Check and update the Parent biases (H4, H1, M30)
-        4. Check and evaluate lower timeframe entry children (H1, M30, M15)
+        Core scanning steps for a single asset. Uses the "Lazy Scan" depth (10 days)
+        to dramatically reduce API transfer payload sizes during 30-second loop cycles.
         """
         state = self.states[symbol]
         
-        # Fetch raw 15-minute bars to construct all timeframes
-        df_raw = self.feed.fetch_raw_data(symbol, timeframe="M15", days=30)
+        # Lazy Scan: 10 days is mathematically optimal to calculate EMAs/ATRs
+        df_raw = self.feed.fetch_raw_data(symbol, timeframe="M15", days=10)
         
         if df_raw.empty or len(df_raw) < 50:
             if config.DEBUG_SUMMARY:
                 print(f"[SCANNER] Insufficient data to scan {symbol}. Rows: {len(df_raw)}")
             return
             
-        # Resample our timeframes to New York Close alignments [2]
         df_h4 = self.feed.resample_candles(df_raw, "H4")
         df_h1 = self.feed.resample_candles(df_raw, "H1")
         df_m30 = self.feed.resample_candles(df_raw, "M30")
         df_m15 = self.feed.resample_candles(df_raw, "M15")
         
         # =====================================================================
-        # STEP A: UPDATE PARENT STRUCTURES [30, 31, 32]
+        # STEP A: UPDATE PARENT STRUCTURES
         # =====================================================================
         
-        # A1: H4 Parent (controls H1) [31, 32]
+        # A1: H4 Parent (controls H1)
         h4_found, h4_pattern = detect_patterns_for_symbol(df_h4, "H4")
         if h4_found and (state.h4_time is None or h4_pattern.bar_time != state.h4_time):
             state.h4_dir = h4_pattern.direction
             state.h4_time = h4_pattern.bar_time
-            state.h4_expire = h4_pattern.bar_time + timedelta(hours=16)  # 4 * H4 time [31]
+            state.h4_expire = h4_pattern.bar_time + timedelta(hours=16)  # 4 * H4 time
             state.h4_pattern_id = f"{symbol}-H4-{int(h4_pattern.bar_time.timestamp())}-{h4_pattern.name}"
             
-            # Record/log the structural breakout [31]
             self._log_and_emit(symbol, h4_pattern, is_parent=True, df_child=df_h4)
             
         # A2: H1 Parent (controls M30)
@@ -232,14 +246,13 @@ class TradingScanner:
             self._log_and_emit(symbol, m30_pattern, is_parent=True, df_child=df_m30)
             
         # =====================================================================
-        # STEP B: SCAN ACTIVE CHILDREN WINDOWS [32, 33]
+        # STEP B: SCAN ACTIVE CHILDREN WINDOWS
         # =====================================================================
         
-        # B1: H1 Child (Gated by active H4 parent) [32, 33]
+        # B1: H1 Child (Gated by active H4 parent)
         is_h4_active = (state.h4_dir != 0) and (now_ny <= state.h4_expire)
         if is_h4_active:
             child_found, child_pattern = detect_patterns_for_symbol(df_h1, "H1")
-            # Only trigger on newly closed bars
             if child_found and child_pattern.direction == state.h4_dir:
                 self._evaluate_and_trigger_child(
                     symbol=symbol, child_sig=child_pattern, parent_id=state.h4_pattern_id,
@@ -269,16 +282,26 @@ class TradingScanner:
                     child_tf="M15", parent_tf="M30"
                 )
 
-    def _evaluate_and_trigger_child(self, symbol, child_sig, parent_id, parent_dir, 
-                                     df_child, df_parent, child_tf, parent_tf, is_backfill=False):
+    def _evaluate_and_trigger_child_historical(self, symbol, child_sig, parent_id, df_child, df_parent):
         """
-        Runs the full multi-timeframe scoring matrix against a detected child signal [33, 34, 35].
-        Computes dynamic risk metrics, stop-losses, targets, and logs the results [23, 24, 25, 27].
+        Wrapper to run scoring and trigger posting during the startup historical backfill.
+        """
+        self._evaluate_and_trigger_child(
+            symbol=symbol, child_sig=child_sig, parent_id=parent_id,
+            parent_dir=child_sig.direction, df_child=df_child, df_parent=df_parent,
+            child_tf=child_sig.tf, parent_tf="H4" if "H1" in child_sig.tf else ("H1" if "M30" in child_sig.tf else "M30")
+        )
+
+    def _evaluate_and_trigger_child(self, symbol, child_sig, parent_id, parent_dir, 
+                                     df_child, df_parent, child_tf, parent_tf):
+        """
+        Runs the full multi-timeframe scoring matrix against a detected child signal.
+        Computes dynamic risk metrics, stop-losses, targets, and logs the results.
         """
         score = 0.0
         reasons = []
         
-        # 1. Outer-Quartile Close Check vs Last Closed Parent [33, 34]
+        # 1. Outer-Quartile Close Check vs Last Closed Parent
         parent_last_bar = df_parent.iloc[-2]
         parent_high = parent_last_bar['High']
         parent_low = parent_last_bar['Low']
@@ -295,7 +318,7 @@ class TradingScanner:
             score += 1.0
             reasons.append("outer_quartile")
             
-        # 2. ATR Ratio Check [34]
+        # 2. ATR Ratio Check
         atr_child_series = calculate_atr(df_child)
         atr_parent_series = calculate_atr(df_parent)
         
@@ -303,11 +326,11 @@ class TradingScanner:
         atr_parent = atr_parent_series.iloc[-2]
         
         ratio = atr_child / atr_parent if atr_parent > 0 else 0
-        if config.RATIO_MIN <= ratio <= config.RATIO_MAX: # [6, 7]
+        if config.RATIO_MIN <= ratio <= config.RATIO_MAX:
             score += 1.0
             reasons.append("atr_ratio_ok")
             
-        # 3. Trend Alignment (20 EMA > 50 EMA for BUY) [34]
+        # 3. Trend Alignment (20 EMA > 50 EMA for BUY)
         ema20 = calculate_ema(df_child['Close'], 20).iloc[-2]
         ema50 = calculate_ema(df_child['Close'], 50).iloc[-2]
         
@@ -321,12 +344,12 @@ class TradingScanner:
             score += 1.0
             reasons.append("trend_aligned")
             
-        # 4. Adaptive CCI Votes [34, 35]
+        # 4. Adaptive CCI Votes
         if config.USE_ADAPTIVE_CCI:
             ar_child = get_latest_acci_reading(df_child)
             ar_parent = get_latest_acci_reading(df_parent)
             
-            # A. Parent CCI Exit Support Check [35]
+            # A. Parent CCI Exit Support Check
             if ar_parent.ok:
                 if child_sig.direction > 0 and ACCI_H4_ExitSupportLong(ar_parent):
                     score += 1.0
@@ -335,14 +358,14 @@ class TradingScanner:
                     score += 1.0
                     reasons.append("cci_parent_exit_support")
                     
-            # B. Child CCI Thrust Check [36]
+            # B. Child CCI Thrust Check
             if ar_child.ok:
                 thrust = ACCI_H1_ThrustLong(ar_child) if child_sig.direction > 0 else ACCI_H1_ThrustShort(ar_child)
                 if thrust:
                     score += 0.5
                     reasons.append("cci_child_thrust")
                     
-                # C. Child CCI Exit Support Check [36, 37]
+                # C. Child CCI Exit Support Check
                 exit_child = False
                 if child_sig.direction > 0:
                     exit_child = (ar_child.cci1 < ar_child.dn1) and (ar_child.cci0 > ar_child.dn0)
@@ -353,23 +376,23 @@ class TradingScanner:
                     score += 0.5
                     reasons.append("cci_child_exit_support")
                     
-                # D. Overextension Penalty Check [37, 38]
+                # D. Overextension Penalty Check
                 overextended = ACCI_H1_OverextendedLong(ar_child) if child_sig.direction > 0 else ACCI_H1_OverextendedShort(ar_child)
                 child_range = child_sig.high - child_sig.low
                 
-                if overextended and atr_child > 0 and child_range >= config.H1_BIG_BAR_ATR_MULT * atr_child: # [7, 38]
+                if overextended and atr_child > 0 and child_range >= config.H1_BIG_BAR_ATR_MULT * atr_child:
                     score -= 0.5
                     reasons.append("cci_overext_penalty")
-                    child_sig.reasons = "prefer_entry2" # Suggest swing entry because breakout is risky [38]
+                    child_sig.reasons = "prefer_entry2"
                     
-        # Classify final signal confidence [38]
+        # Classify final signal confidence
         child_sig.confidence = "strong" if score >= 3.0 else ("normal" if score >= 1.5 else "weak")
         child_sig.reasons = "|".join(reasons) if not child_sig.reasons else f"{child_sig.reasons}|" + "|".join(reasons)
         
         # =====================================================================
-        # DYNAMIC RISK CALCULATOR ENGINE [23, 24, 25]
+        # DYNAMIC RISK CALCULATOR ENGINE
         # =====================================================================
-        spread_points = 1.5 # Placeholder estimated spread (1.5 pips)
+        spread_points = 1.5
         point_scale = 0.01 if "JPY" in symbol or child_sig.close > 50 else 0.0001
         spr_price = spread_points * point_scale
         
@@ -377,7 +400,7 @@ class TradingScanner:
         if entry_buf < spr_price:
             entry_buf = spr_price
             
-        # Dynamically scale Stop-Loss size based on timeframe ATR ratios [6, 7, 23]
+        # Dynamically scale Stop-Loss size based on timeframe ATR ratios
         clamped_ratio = max(config.RATIO_MIN, min(ratio, config.RATIO_MAX))
         w = (clamped_ratio - config.RATIO_MIN) / (config.RATIO_MAX - config.RATIO_MIN)
         sl_multiplier = config.H1_DYN_MIN + w * (config.H1_DYN_MAX - config.H1_DYN_MIN)
@@ -386,7 +409,7 @@ class TradingScanner:
         if sl_buf < 2.0 * spr_price:
             sl_buf = 2.0 * spr_price
             
-        # Assign coordinates [23, 24]
+        # Assign coordinates
         H = child_sig.high
         L = child_sig.low
         
@@ -397,51 +420,46 @@ class TradingScanner:
             child_sig.entry_price = L - entry_buf
             child_sig.sl = H + sl_buf
             
-        # Entry 1 Take Profits [24]
+        # Entry 1 Take Profits
         R1 = abs(child_sig.entry_price - child_sig.sl)
         child_sig.tp1 = child_sig.entry_price + R1 if child_sig.direction > 0 else child_sig.entry_price - R1
         child_sig.tp2 = child_sig.entry_price + 2.0 * R1 if child_sig.direction > 0 else child_sig.entry_price - 2.0 * R1
         
-        # Entry 2 (Swing Midpoint Entry) [24]
+        # Entry 2 (Swing Midpoint Entry)
         child_sig.entry2_price = 0.5 * (H + L)
         R2 = abs(child_sig.entry2_price - child_sig.sl)
         child_sig.tp1_swing = child_sig.entry2_price + R2 if child_sig.direction > 0 else child_sig.entry2_price - R2
-        child_sig.tp2_swing = child_sig.entry2_price + 2.0 * R2 if child_sig.direction > 0 else child_sig.entry2_price - 2.0 * R2 # [24, 25]
+        child_sig.tp2_swing = child_sig.entry2_price + 2.0 * R2 if child_sig.direction > 0 else child_sig.entry2_price - 2.0 * R2
         
-        self._log_and_emit(symbol, child_sig, is_parent=False, parent_id=parent_id, df_child=df_child, is_backfill=is_backfill)
+        self._log_and_emit(symbol, child_sig, is_parent=False, parent_id=parent_id, df_child=df_child)
 
-    def _log_and_emit(self, symbol, sig, is_parent=False, parent_id="", df_child=None, is_backfill=False):
+    def _log_and_emit(self, symbol, sig, is_parent=False, parent_id="", df_child=None):
         """
-        Formats signal output, prints to console, and appends to the csv file [25, 26, 27].
-        Matches 'PrintSignalMsg' and 'WriteCSV' in the original code [25, 26, 27].
+        Formats signal output, prints to console, and appends to the csv file.
         Sends rich JSON payload (including embedded candlestick data for mobile charts) to Webhook API.
+        Now includes a brief sleep to prevent overloading Render's free tier processor.
         """
         direction_label = "BUY" if sig.direction > 0 else "SELL"
         dg = 2 if "JPY" in symbol or sig.close > 50 else 5
         
         if is_parent:
-            # Major structure update [31]
-            if not is_backfill:
-                msg = f"--- [PARENT BLOCK] [{symbol} {sig.tf}] Pattern: {sig.name} Dir: {direction_label} at {sig.bar_time.strftime('%Y-%m-%d %H:%M EST')}"
-                print(msg)
+            msg = f"--- [PARENT BLOCK] [{symbol} {sig.tf}] Pattern: {sig.name} Dir: {direction_label} at {sig.bar_time.strftime('%Y-%m-%d %H:%M EST')}"
+            print(msg)
         else:
-            # Children Signal update [25, 26, 39]
-            prefix = "[BACKFILL]" if is_backfill else "🚨"
             msg = (
-                f"{prefix} [{symbol} {sig.tf}] {sig.name} ({sig.confidence.upper()}) | Dir: {direction_label} | "
+                f"🚨 [{symbol} {sig.tf}] {sig.name} ({sig.confidence.upper()}) | Dir: {direction_label} | "
                 f"Entry1: {sig.entry_price:.{dg}f} | SL: {sig.sl:.{dg}f} | TP1: {sig.tp1:.{dg}f} | TP2: {sig.tp2:.{dg}f} | "
                 f"Entry2 (Swing): {sig.entry2_price:.{dg}f} | TP1_s: {sig.tp1_swing:.{dg}f} | TP2_s: {sig.tp2_swing:.{dg}f} | "
                 f"Reasons: {sig.reasons}"
             )
             print(msg)
             
-            # Build and send rich JSON payload if webhook is enabled [3, 4]
+            # Build and send rich JSON payload if webhook is enabled
             if config.ENABLE_WEBHOOK and config.WEBHOOK_URL:
                 try:
                     # Capture last 25 candles leading up to the signal for the MT5-grade mobile chart rendering
                     candles_list = []
                     if df_child is not None:
-                        # Grab completed bars up to current
                         df_tail = df_child.tail(25)
                         for timestamp, row in df_tail.iterrows():
                             candles_list.append({
@@ -452,7 +470,7 @@ class TradingScanner:
                                 "close": float(row['Close'])
                             })
                             
-                    # Construct high-fidelity MQL5-style zones for shading on phone [12, 13, 14, 15]
+                    # Construct high-fidelity MQL5-style zones for shading on phone
                     payload = {
                         "type": "signal",
                         "symbol": symbol,
@@ -492,7 +510,6 @@ class TradingScanner:
                     }
                     
                     headers = {"Content-Type": "application/json"}
-                    # Parse custom authorization header if supplied [4, 11]
                     if config.AUTH_HEADER:
                         if ":" in config.AUTH_HEADER:
                             k, v = config.AUTH_HEADER.split(":", 1)
@@ -500,20 +517,24 @@ class TradingScanner:
                         else:
                             headers["X-Api-Key"] = config.AUTH_HEADER
                             
-                    # Fire-and-forget webhook request [10, 11]
+                    # Fire POST request
                     requests.post(
                         config.WEBHOOK_URL, 
                         json=payload, 
                         headers=headers, 
                         timeout=config.WEBHOOK_TIMEOUT_MS / 1000.0
                     )
-                    if config.DEBUG_SUMMARY and not is_backfill:
+                    
+                    if config.DEBUG_SUMMARY:
                         print(f"[WEBHOOK] Transmitted signal {symbol} {sig.tf} payload successfully.")
+                        
+                    # Politeness Delay: pause briefly to prevent overrunning the Render free-tier CPU
+                    time.sleep(0.25)
+                    
                 except Exception as ex:
-                    if not is_backfill:
-                        print(f"[WEBHOOK ERROR] Failed to send webhook packet: {ex}")
+                    print(f"[WEBHOOK ERROR] Failed to send webhook packet: {ex}")
                 
-        # Save to local CSV spreadsheet [27]
+        # Save to local CSV spreadsheet
         if config.WRITE_CSV:
             file_exists = os.path.exists(config.CSV_PATH)
             with open(config.CSV_PATH, mode='a', newline='') as f:
@@ -533,6 +554,5 @@ class TradingScanner:
                 ])
 
 if __name__ == "__main__":
-    # Test scanner coordination with mock feed data
     scanner = TradingScanner()
     scanner.run_scan_cycle()

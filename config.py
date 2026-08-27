@@ -10,15 +10,37 @@ import os
 # =====================================================================
 # To use this scanner, register for a free account at https://api.tiingo.com
 # The free API key allows you to scan currency pairs and cryptocurrencies.
-TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "2fac73017858992590f586b0f1c4253272a2ee6f")
+# Supports pooling: list multiple keys separated by commas to load-balance requests!
+TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "2fac73017858992590f586b0f1c4253272a2ee6f, 5df00b430c4fcbb3b30ddcc70564a62bd1c75f9d, 16934076793cf20c6f01106f6b765622362c9732, 7f64a92153c5f962e9717e37b06ec88bf30a2700, e3c76de88aa3850661f29426661db73b36d10b13")
 
 # =====================================================================
 # 2. TARGET SYMBOLS TO SCAN
 # =====================================================================
-# A list of assets we want to monitor. You can add or remove assets here.
+# A complete list of major and minor Forex pairs, commodities, and BTC.
+# Fully scalable under our new multi-key pooled and throttled engine.
 SYMBOLS = [
+    # --- Majors & Major Minors ---
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
-    "EURGBP", "EURJPY", "GBPJPY", "XAUUSD", "XAGUSD"
+    
+    # --- Euro Crosses ---
+    "EURGBP", "EURJPY", "EURCHF", "EURAUD", "EURNZD", "EURCAD",
+    
+    # --- Pound Crosses ---
+    "GBPJPY", "GBPCHF", "GBPAUD", "GBPNZD", "GBPCAD",
+    
+    # --- Aussie & Kiwi Crosses ---
+    "AUDJPY", "AUDCHF", "AUDCAD", "AUDNZD",
+    "NZDJPY", "NZDCHF", "NZDCAD",
+    
+    # --- Cadet & Franc Crosses ---
+    "CADJPY", "CADCHF",
+    "CHFJPY",
+    
+    # --- Metals & Commodities ---
+    "XAUUSD", "XAGUSD", "USOUSD",
+    
+    # --- Cryptocurrencies ---
+    "BTCUSD"
 ]
 
 # =====================================================================
@@ -76,7 +98,7 @@ CSV_PATH = "signals_multi_tf.csv"  # Output filename for alerts and historical l
 DEBUG_SUMMARY = True         # Show detailed diagnostic logs in the terminal [3]
 
 # Webhook Alerting (Optional)
-ENABLE_WEBHOOK = False       # Set to True to send automated POST signals [4]
-WEBHOOK_URL = ""             # URL of your Discord, Telegram, or custom server [4]
+ENABLE_WEBHOOK = True       # Set to True to send automated POST signals [4]
+WEBHOOK_URL = "https://tradohelfer-api.onrender.com/webhook"             # URL of your Discord, Telegram, or custom server [4]
 AUTH_HEADER = "X-Api-Key: Ikealoben_2025bijna"  # Secure API key header for webhook endpoints [4]
 WEBHOOK_TIMEOUT_MS = 15000   # Webhook request timeout in milliseconds [4]
