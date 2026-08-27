@@ -99,6 +99,6 @@ DEBUG_SUMMARY = True         # Show detailed diagnostic logs in the terminal [3]
 
 # Webhook Alerting (Optional)
 ENABLE_WEBHOOK = True       # Set to True to send automated POST signals [4]
-WEBHOOK_URL = "https://tradohelfer-api.onrender.com/webhook"             # URL of your Discord, Telegram, or custom server [4]
+WEBHOOK_URL = "http://127.0.0.1:8000/webhook"             # URL of your Discord, Telegram, or custom server [4]
 AUTH_HEADER = "X-Api-Key: Ikealoben_2025bijna"  # Secure API key header for webhook endpoints [4]
 WEBHOOK_TIMEOUT_MS = 15000   # Webhook request timeout in milliseconds [4]
