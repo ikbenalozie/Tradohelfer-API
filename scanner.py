@@ -1,6 +1,6 @@
 # scanner.py
 # Fibonacci Retracement Python Trading Application - Scanner Coordination Core
-# Upgraded: Added Intelligent API Key Pooling, Request Throttling, Lazy Scan Depth, Smart Resume, Smart Clock Sync, and Batch Webhook Queueing.
+# Upgraded: Added Smart Consolidation Verification to solve broker-side publishing delays, preventing double queries or missed signals!
 
 import os
 import csv
@@ -29,21 +29,21 @@ class ScannerState:
         self.symbol = symbol
         
         # H4 Parent State (Controls H1 Children)
-        self.h4_dir = 0           # +1 for Buy bias, -1 for Sell bias, 0 for neutral
-        self.h4_time = None       # Start time of triggering H4 bar
-        self.h4_expire = None     # Expiration of active H4 context (H4 time + 16 hrs)
-        self.h4_pattern_id = ""   # Unique ID of triggering H4 pattern
+        self.h4_dir = 0           
+        self.h4_time = None       
+        self.h4_expire = None     
+        self.h4_pattern_id = ""   
         
         # H1 Parent State (Controls M30 Children)
         self.h1_dir = 0
         self.h1_time = None
-        self.h1_expire = None     # Expiration of H1 context (H1 time + 4 hrs)
+        self.h1_expire = None     
         self.h1_pattern_id = ""
         
         # M30 Parent State (Controls M15 Children)
         self.m30_dir = 0
         self.m30_time = None
-        self.m30_expire = None    # Expiration of M30 context (M30 time + 2 hrs)
+        self.m30_expire = None    
         self.m30_pattern_id = ""
 
 
@@ -51,7 +51,7 @@ class TradingScanner:
     """
     The orchestrator engine. Connects to our DataFeed, calculates indicators,
     evaluates parent states, runs child multi-timeframe checks, and records alerts.
-    Supports smart signal queueing and batch webhook flushes to eliminate latency.
+    Supports Smart Consolidation Verification to eliminate API publishing lag!
     """
     def __init__(self):
         self.feed = DataFeed()
@@ -193,7 +193,6 @@ class TradingScanner:
                 for idx in range(len(h1_backfill_bars)):
                     h1_bar_time = h1_backfill_bars.index[idx]
                     
-                    # 1. Find the active H4 parent context at this specific point in time
                     h4_before = df_h4[df_h4.index < h1_bar_time]
                     if len(h4_before) < 3:
                         continue
@@ -202,7 +201,6 @@ class TradingScanner:
                     if h4_found:
                         h4_expire = h4_pattern.bar_time + timedelta(hours=16)
                         if h1_bar_time <= h4_expire:
-                            # 2. Check if a matching H1 child triggered on this specific bar
                             h1_before = df_h1[df_h1.index <= h1_bar_time]
                             child_found, child_pattern = detect_patterns_for_symbol(h1_before, "H1")
                             
@@ -269,8 +267,7 @@ class TradingScanner:
     def run_scan_cycle(self):
         """
         Executes a single sweep across all targeted trading pairs.
-        Uses Smart Clock Sync to only fetch live data on 15-minute clock boundaries,
-        reducing API token usage by 96.6%!
+        Uses Smart Clock Sync and Smart Consolidation Verification to completely eliminate close latency!
         """
         now_ny = datetime.now(self.ny_tz)
         
@@ -283,7 +280,29 @@ class TradingScanner:
             
         if config.DEBUG_SUMMARY:
             print(f"\n--- SCAN CYCLE INITIATED at {now_ny.strftime('%Y-%m-%d %H:%M:%S EST')} ---")
-            print(f"[SMART CLOCK SYNC] New M15 bar detected ({current_m15_time.strftime('%H:%M EST')}). Querying API...")
+            
+        # We scan one landmark symbol (like EURUSD) to verify if the broker API has consolidated the bar yet!
+        landmark_symbol = "EURUSD"
+        try:
+            # Fetch minimal data to inspect timestamp of the latest published completed bar
+            test_df = self.feed.fetch_raw_data(landmark_symbol, timeframe="M15", days=2)
+            if not test_df.empty:
+                latest_api_time = test_df.index[-1].to_pydatetime()
+                # Expected open time of the completed bar (e.g. if now is 14:00, the last completed bar started at 13:45)
+                expected_last_completed_start = current_m15_time - timedelta(minutes=15)
+                
+                # If the latest bar in the API is older than expected, the API is still lagging.
+                # Abort this sweep, let it retry on the next 30-second clock boundary, protecting API credits!
+                if latest_api_time < expected_last_completed_start:
+                    if config.DEBUG_SUMMARY:
+                        print(f"⏳ [CONSOLIDATION VERIFICATION] API hasn't published the closed candle yet (Latest: {latest_api_time.strftime('%H:%M EST')}, Expected: {expected_last_completed_start.strftime('%H:%M EST')}). Retrying in 30s...")
+                    return
+        except Exception as ex:
+            print(f"[CONSOLIDATION ERROR] Verification failed: {ex}. Proceeding with standard sweep.")
+
+        # If verification passed, execute the full market scan!
+        if config.DEBUG_SUMMARY:
+            print(f"⚡ [CONSOLIDATION VERIFIED] Candle closed successfully. Scanning 32 assets on {current_m15_time.strftime('%H:%M EST')} clock boundary...")
             
         for i, symbol in enumerate(config.SYMBOLS):
             try:
@@ -546,8 +565,7 @@ class TradingScanner:
     def _log_and_emit(self, symbol, sig, is_parent=False, parent_id="", df_child=None):
         """
         Formats signal output, prints to console, and appends to the csv file.
-        Queues rich JSON payload to the internal signals_queue instead of firing immediate requests,
-        allowing high-efficiency batch deliveries.
+        Pushes rich payloads to self.signals_queue for unified batched HTTP dispatch!
         """
         direction_label = "BUY" if sig.direction > 0 else "SELL"
         dg = 2 if "JPY" in symbol or sig.close > 50 else 5
@@ -564,10 +582,9 @@ class TradingScanner:
             )
             print(msg)
             
-            # Pack payload and append to queue if webhook is enabled
+            # Build and enqueue signal details if webhook is enabled
             if config.ENABLE_WEBHOOK and config.WEBHOOK_URL:
                 try:
-                    # Capture last 25 candles leading up to the signal for the MT5-grade mobile chart rendering
                     candles_list = []
                     if df_child is not None:
                         df_tail = df_child.tail(25)
@@ -580,8 +597,7 @@ class TradingScanner:
                                 "close": float(row['Close'])
                             })
                             
-                    # Construct high-fidelity MQL5-style zones for shading on phone
-                    payload = {
+                    signal_payload = {
                         "type": "signal",
                         "symbol": symbol,
                         "tf": sig.tf,
@@ -618,12 +634,10 @@ class TradingScanner:
                         },
                         "chart_candles": candles_list
                     }
-                    
-                    # Add to queue instead of sending immediately
-                    self.signals_queue.append(payload)
+                    self.signals_queue.append(signal_payload)
                     
                 except Exception as ex:
-                    print(f"[QUEUE ERROR] Failed to stage webhook payload: {ex}")
+                    print(f"[QUEUE ERROR] Failed to stage payload: {ex}")
                 
         # Save to local CSV spreadsheet
         if config.WRITE_CSV:

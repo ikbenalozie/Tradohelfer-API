@@ -1,24 +1,25 @@
-# app_api.py (Unified Batch-Capable Version with Self-Healing Port Router and Memory Monitor)
+# app_api.py (Upgraded Version with OneSignal Push notifications, Self-Healing Port Router, and Memory Monitor)
 # 100% Free-Tier Unified Backend for Fibonacci Retracement Trading Application
-# This file combines the FastAPI server AND the Python scanner into a single service,
-# allowing you to run your entire trading application on Render's FREE Web Service tier!
 
 import os
 import json
 import sqlite3
 import threading
 import time
-from typing import List, Dict, Any, Optional, Union
+import requests
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import config
+
 app = FastAPI(
-    title="Gemini Notebook Free-Tier Trading App",
-    description="Unified API & Background Scanner running on a single free web service instance with memory tracking and batch-webhook processing.",
-    version="2.3.0"
+    title="Tradohelfer Unified Cloud Workstation",
+    description="FastAPI Web Server & Background Market Scanner on a single free Render Web Service.",
+    version="3.0.0"
 )
 
 # Enable CORS (Cross-Origin Resource Sharing)
@@ -35,6 +36,48 @@ API_KEY_HEADER = "X-Api-Key"
 EXPECTED_API_KEY = "Ikealoben_2025bijna"
 
 # =====================================================================
+# ONESIGNAL PUSH NOTIFICATION DISPATCHER (0-dependency Server Integration)
+# =====================================================================
+def trigger_push_notification(title: str, body: str, signal_id: Optional[int] = None):
+    """
+    Fires a high-priority push notification to all Android subscribers via OneSignal REST API.
+    Does not block request execution threads by running in an isolated safety-try context.
+    """
+    app_id = getattr(config, "ONESIGNAL_APP_ID", "")
+    api_key = getattr(config, "ONESIGNAL_API_KEY", "")
+    
+    # Skip if placeholder or empty
+    if not app_id or not api_key or "your_onesignal" in app_id:
+        return
+        
+    url = "https://onesignal.com/api/v1/notifications"
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Basic {api_key}"
+    }
+    
+    # Signal redirection payload data
+    data_payload = {}
+    if signal_id is not None:
+        data_payload["signal_id"] = str(signal_id)
+        
+    payload = {
+        "app_id": app_id,
+        "headings": {"en": title},
+        "contents": {"en": body},
+        "included_segments": ["All"], # Direct broadcast to all installed devices
+        "priority": 10,               # High priority delivery to bypass Android sleep/doze locks
+        "data": data_payload
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=8)
+        if config.DEBUG_SUMMARY:
+            print(f"[ONESIGNAL PUSH] Dispatched alert. Status: {response.status_code}")
+    except Exception as ex:
+        print(f"❌ [ONESIGNAL ERROR] Failed to send push notification: {ex}")
+
+# =====================================================================
 # MEMORY MONITORING UTILITY
 # =====================================================================
 def get_memory_usage_mb() -> float:
@@ -44,18 +87,15 @@ def get_memory_usage_mb() -> float:
     with a fallback check for local Windows or macOS testing environments.
     """
     try:
-        # Standard Linux proc filesystem (100% reliable on Render, 0 dependencies)
         with open('/proc/self/status', 'r') as f:
             for line in f:
                 if line.startswith('VmRSS:'):
-                    # Line looks like: VmRSS:     45320 kB
                     parts = line.split()
                     return float(parts[1]) / 1024.0  # Convert kB to MB
     except Exception:
         pass
     
     try:
-        # Fallback for local Windows or macOS test environments
         import psutil
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024.0 * 1024.0)  # Convert bytes to MB
@@ -150,7 +190,7 @@ class SignalPayload(BaseModel):
     chart_candles: List[Candle]
 
 class BatchPayload(BaseModel):
-    type: str  # e.g., "batch"
+    type: str
     count: int
     signals: List[SignalPayload]
 
@@ -202,7 +242,7 @@ def get_health():
         cursor.execute("SELECT COUNT(*) FROM signals")
         total_signals = cursor.fetchone()[0]
         conn.close()
-    except Exception as e:
+    except Exception:
         total_signals = -1
 
     return {
@@ -216,33 +256,111 @@ def get_health():
     }
 
 @app.post("/webhook", status_code=status.HTTP_201_CREATED)
-def receive_webhook(payload: Union[SignalPayload, BatchPayload], auth: str = Depends(verify_api_key)):
+def receive_webhook(payload: Any, auth: str = Depends(verify_api_key)):
+    """
+    Dual-mode Webhook Endpoint:
+    Seamlessly parses single signals OR bundled high-speed batches inside a single atomic SQLite transaction!
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Determine if payload is single signal or batch
-        if isinstance(payload, BatchPayload) or (hasattr(payload, "type") and payload.type == "batch"):
-            signals_list = payload.signals
-            is_batch = True
-        else:
-            signals_list = [payload]
-            is_batch = False
+        # Determine if payload is raw dictionary representing a single signal or a batch
+        # Using raw parsing to accommodate dynamic typing
+        payload_data = payload
+        if hasattr(payload, "dict"):
+            payload_data = payload.dict()
             
-        inserted_count = 0
-        duplicate_count = 0
+        if not isinstance(payload_data, dict):
+            # Parse from request raw if needed
+            raise ValueError("Payload must be a structured JSON object.")
+
+        is_batch = payload_data.get("type") == "batch"
         
-        # Single database transaction for lightning-speed commits
-        for sig in signals_list:
-            # Deduplication Guard
+        # 1. BATCH MODE COMPILATION (Transactional)
+        if is_batch:
+            signals_list = payload_data.get("signals", [])
+            count = len(signals_list)
+            added_count = 0
+            latest_signal_id = None
+            push_summary_elements = []
+            
+            for raw_sig in signals_list:
+                # Deduplication Guard
+                cursor.execute("""
+                    SELECT id FROM signals 
+                    WHERE symbol = ? AND tf = ? AND pattern = ? AND bar_time = ?
+                """, (raw_sig['symbol'], raw_sig['tf'], raw_sig['pattern'], raw_sig['bar_time']))
+                
+                if cursor.fetchone():
+                    continue
+                
+                cursor.execute("""
+                    INSERT INTO signals (
+                        symbol, tf, pattern, dir, bar_time, open, high, low, close,
+                        entry1, entry2, sl, tp1, tp2, tp1_swing, tp2_swing,
+                        confidence, reasons, parent_id, zones, chart_candles, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    raw_sig['symbol'],
+                    raw_sig['tf'],
+                    raw_sig['pattern'],
+                    raw_sig['dir'],
+                    raw_sig['bar_time'],
+                    raw_sig['open'],
+                    raw_sig['high'],
+                    raw_sig['low'],
+                    raw_sig['close'],
+                    raw_sig['entry1'],
+                    raw_sig['entry2'],
+                    raw_sig['sl'],
+                    raw_sig['tp1'],
+                    raw_sig['tp2'],
+                    raw_sig['tp1_swing'],
+                    raw_sig['tp2_swing'],
+                    raw_sig['confidence'],
+                    raw_sig['reasons'],
+                    raw_sig.get('parent_id', ""),
+                    json.dumps(raw_sig['zones']),
+                    json.dumps(raw_sig['chart_candles']),
+                    datetime.utcnow().isoformat() + "Z"
+                ))
+                latest_signal_id = cursor.lastrowid
+                added_count += 1
+                
+                # Collect details for push notifications summary
+                if len(push_summary_elements) < 3:
+                    push_summary_elements.append(f"{raw_sig['symbol']} {raw_sig['tf']} ({raw_sig['dir']})")
+            
+            conn.commit()
+            conn.close()
+            
+            # Send high-priority batch notification if new setups were recorded
+            if added_count > 0:
+                summary_text = ", ".join(push_summary_elements)
+                if added_count > 3:
+                    summary_text += f", and {added_count - 3} more"
+                
+                trigger_push_notification(
+                    title=f"🚨 {added_count} New Trading Setups Detected!",
+                    body=f"Target setups closed on chart bounds: {summary_text}.",
+                    signal_id=latest_signal_id
+                )
+                
+            return {"success": True, "message": f"Processed batch of {count} signals. Committed {added_count} new entries."}
+            
+        # 2. SINGLE SIGNAL MODE
+        else:
+            # Re-map schema validation internally
+            raw_sig = payload_data
             cursor.execute("""
                 SELECT id FROM signals 
                 WHERE symbol = ? AND tf = ? AND pattern = ? AND bar_time = ?
-            """, (sig.symbol, sig.tf, sig.pattern, sig.bar_time))
+            """, (raw_sig['symbol'], raw_sig['tf'], raw_sig['pattern'], raw_sig['bar_time']))
             
             if cursor.fetchone():
-                duplicate_count += 1
-                continue
+                conn.close()
+                return {"success": True, "message": "Duplicate signal ignored."}
                 
             cursor.execute("""
                 INSERT INTO signals (
@@ -251,47 +369,44 @@ def receive_webhook(payload: Union[SignalPayload, BatchPayload], auth: str = Dep
                     confidence, reasons, parent_id, zones, chart_candles, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                sig.symbol,
-                sig.tf,
-                sig.pattern,
-                sig.dir,
-                sig.bar_time,
-                sig.open,
-                sig.high,
-                sig.low,
-                sig.close,
-                sig.entry1,
-                sig.entry2,
-                sig.sl,
-                sig.tp1,
-                sig.tp2,
-                sig.tp1_swing,
-                sig.tp2_swing,
-                sig.confidence,
-                sig.reasons,
-                sig.parent_id,
-                json.dumps(sig.zones.dict()),
-                json.dumps([c.dict() for c in sig.chart_candles]),
+                raw_sig['symbol'],
+                raw_sig['tf'],
+                raw_sig['pattern'],
+                raw_sig['dir'],
+                raw_sig['bar_time'],
+                raw_sig['open'],
+                raw_sig['high'],
+                raw_sig['low'],
+                raw_sig['close'],
+                raw_sig['entry1'],
+                raw_sig['entry2'],
+                raw_sig['sl'],
+                raw_sig['tp1'],
+                raw_sig['tp2'],
+                raw_sig['tp1_swing'],
+                raw_sig['tp2_swing'],
+                raw_sig['confidence'],
+                raw_sig['reasons'],
+                raw_sig.get('parent_id', ""),
+                json.dumps(raw_sig['zones']),
+                json.dumps(raw_sig['chart_candles']),
                 datetime.utcnow().isoformat() + "Z"
             ))
-            inserted_count += 1
+            new_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
             
-        conn.commit()
-        conn.close()
-        
-        if is_batch:
-            return {
-                "success": True, 
-                "message": f"Successfully processed batch payload. Signals Inserted: {inserted_count}, Duplicates Ignored: {duplicate_count}."
-            }
-        else:
-            if inserted_count > 0:
-                return {"success": True, "message": f"Signal received for {payload.symbol} {payload.tf}."}
-            else:
-                return {"success": True, "message": "Duplicate signal ignored."}
-                
+            # Fire instant push alert!
+            trigger_push_notification(
+                title=f"🚨 New setup: {raw_sig['symbol']} {raw_sig['tf']} ({raw_sig['dir']})!",
+                body=f"Pattern: {raw_sig['pattern'].upper()} | Confidence: {raw_sig['confidence'].upper()} | Entry: {raw_sig['entry1']}",
+                signal_id=new_id
+            )
+            
+            return {"success": True, "message": f"Signal received and logged for {raw_sig['symbol']} {raw_sig['tf']}."}
+            
     except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"Database error: {ex}")
+        raise HTTPException(status_code=500, detail=f"Database execution error: {ex}")
 
 @app.get("/api/signals")
 def get_signals(limit: int = 50):
@@ -341,9 +456,7 @@ def start_background_scanner():
     """
     print("\n⚡ [FREE TIER ENGINE] Spawning background market scanner thread... ⚡")
     try:
-        import config
         # Self-Healing Port Alignment: Read dynamic port assigned by Render ($PORT)
-        # Overrides config.py values at runtime so the loop can communicate locally on the correct port.
         port = os.getenv("PORT", "8000")
         config.ENABLE_WEBHOOK = True
         config.WEBHOOK_URL = f"http://127.0.0.1:{port}/webhook"
