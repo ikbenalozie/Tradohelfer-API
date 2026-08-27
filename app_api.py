@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="Gemini Notebook Trading Scanner API",
     description="Backend API to receive trading alerts and serve candlestick data to mobile clients.",
-    version="1.0.0"
+    version="1.0.1"
 )
 
 # Enable CORS (Cross-Origin Resource Sharing) so our mobile/web app can connect freely
@@ -148,11 +148,23 @@ def receive_webhook(payload: SignalPayload, auth: str = Depends(verify_api_key))
     """
     Webhook endpoint hit by our Python scanner.
     Saves the full detailed signal including zones and historical candles.
+    Avoids duplicate entries by checking if the signal was already logged.
     """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        # Deduplication check: verify if we already logged this pattern at this bar_time
+        cursor.execute("""
+            SELECT id FROM signals 
+            WHERE symbol = ? AND tf = ? AND bar_time = ? AND pattern = ?
+        """, (payload.symbol, payload.tf, payload.bar_time, payload.pattern))
+        
+        existing = cursor.fetchone()
+        if existing:
+            conn.close()
+            return {"success": True, "message": f"Signal already logged for {payload.symbol} {payload.tf} at {payload.bar_time}. Skipping duplicate."}
+            
         cursor.execute("""
             INSERT INTO signals (
                 symbol, tf, pattern, dir, bar_time, open, high, low, close,
