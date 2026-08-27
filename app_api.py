@@ -1,4 +1,4 @@
-# app_api.py (Upgraded Version with Resource & Memory Monitoring)
+# app_api.py (Upgraded Version with Self-Healing Port Router and Memory Monitor)
 # 100% Free-Tier Unified Backend for Fibonacci Retracement Trading Application
 # This file combines the FastAPI server AND the Python scanner into a single service,
 # allowing you to run your entire trading application on Render's FREE Web Service tier!
@@ -18,7 +18,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="Gemini Notebook Free-Tier Trading App",
     description="Unified API & Background Scanner running on a single free web service instance with memory tracking.",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 # Enable CORS (Cross-Origin Resource Sharing)
@@ -306,9 +306,18 @@ def start_background_scanner():
     """
     Spawns main.py's scanning loop inside a background daemon thread.
     This runs continuously in parallel with the FastAPI server.
+    Automatically handles self-healing port mapping based on Render's configuration.
     """
     print("\n⚡ [FREE TIER ENGINE] Spawning background market scanner thread... ⚡")
     try:
+        import config
+        # Self-Healing Port Alignment: Read dynamic port assigned by Render ($PORT)
+        # Overrides config.py values at runtime so the loop can communicate locally on the correct port.
+        port = os.getenv("PORT", "8000")
+        config.ENABLE_WEBHOOK = True
+        config.WEBHOOK_URL = f"http://127.0.0.1:{port}/webhook"
+        print(f"⚡ [FREE TIER ENGINE] Self-healing router successfully active! Webhook overridden to: {config.WEBHOOK_URL}")
+
         import main
         # Run main loop as a separate daemon thread so it doesn't block the API
         scanner_thread = threading.Thread(target=main.main, daemon=True)
