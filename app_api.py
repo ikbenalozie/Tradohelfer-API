@@ -1,11 +1,13 @@
-# app_api.py
-# FastAPI Web Server Backend for Fibonacci Retracement Python Trading Application
-# Receives scanner signal webhook payloads, stores them in an SQLite database,
-# and serves them to our Flutter mobile application with high efficiency.
+# app_api.py (Upgraded Version with Resource & Memory Monitoring)
+# 100% Free-Tier Unified Backend for Fibonacci Retracement Trading Application
+# This file combines the FastAPI server AND the Python scanner into a single service,
+# allowing you to run your entire trading application on Render's FREE Web Service tier!
 
 import os
 import json
 import sqlite3
+import threading
+import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import uvicorn
@@ -14,12 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(
-    title="Gemini Notebook Trading Scanner API",
-    description="Backend API to receive trading alerts and serve candlestick data to mobile clients.",
-    version="1.0.1"
+    title="Gemini Notebook Free-Tier Trading App",
+    description="Unified API & Background Scanner running on a single free web service instance with memory tracking.",
+    version="2.1.0"
 )
 
-# Enable CORS (Cross-Origin Resource Sharing) so our mobile/web app can connect freely
+# Enable CORS (Cross-Origin Resource Sharing)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,10 +32,38 @@ app.add_middleware(
 
 DB_PATH = "scanner_signals.db"
 API_KEY_HEADER = "X-Api-Key"
-EXPECTED_API_KEY = "Ikealoben_2025bijna"  # Matches config.py Auth Header
+EXPECTED_API_KEY = "Ikealoben_2025bijna"
 
 # =====================================================================
-# DATABASE SETUP (SQLite - Free, lightweight and zero-dependency)
+# MEMORY MONITORING UTILITY
+# =====================================================================
+def get_memory_usage_mb() -> float:
+    """
+    Returns the current resident memory usage of this process in Megabytes (MB).
+    Reads the Linux /proc filesystem directly for 0-dependency performance on Render,
+    with a fallback check for local Windows or macOS testing environments.
+    """
+    try:
+        # Standard Linux proc filesystem (100% reliable on Render, 0 dependencies)
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # Line looks like: VmRSS:     45320 kB
+                    parts = line.split()
+                    return float(parts[1]) / 1024.0  # Convert kB to MB
+    except Exception:
+        pass
+    
+    try:
+        # Fallback for local Windows or macOS test environments
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024.0 * 1024.0)  # Convert bytes to MB
+    except Exception:
+        return 0.0
+
+# =====================================================================
+# DATABASE SETUP
 # =====================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -68,11 +98,10 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize Database
 init_db()
 
 # =====================================================================
-# PYDANTIC SCHEMAS (Data Validation Models)
+# DATA VALIDATION SCHEMAS
 # =====================================================================
 class ZoneRange(BaseModel):
     low: float
@@ -121,7 +150,7 @@ class SignalPayload(BaseModel):
     chart_candles: List[Candle]
 
 # =====================================================================
-# SECURITY DEPENDENCY (Validates API key from scanner webhook)
+# SECURITY DEPENDENCY
 # =====================================================================
 def verify_api_key(x_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER)):
     if x_api_key != EXPECTED_API_KEY:
@@ -132,38 +161,70 @@ def verify_api_key(x_api_key: Optional[str] = Header(None, alias=API_KEY_HEADER)
     return x_api_key
 
 # =====================================================================
-# API ROUTERS & ENDPOINTS
+# ENDPOINTS
 # =====================================================================
-
 @app.get("/")
 def read_root():
     return {
         "status": "online",
-        "service": "Gemini Notebook Scanner API",
+        "service": "Gemini Unified Free Service",
+        "time": datetime.utcnow().isoformat() + "Z",
+        "info": "To keep this service awake for free, set up a ping on UptimeRobot to hit this URL every 10 minutes."
+    }
+
+@app.get("/api/health")
+def get_health():
+    """
+    Lightweight diagnostic endpoint to monitor server health, thread count, 
+    SQLite database records, and active process memory utilisation vs Render's 512MB limit.
+    """
+    mem_used = get_memory_usage_mb()
+    mem_capacity = 512.0  # Render Free Tier Limit
+    mem_percent = (mem_used / mem_capacity) * 100.0 if mem_used > 0 else 0.0
+    
+    # Classify overall server health based on memory utilisation
+    health_status = "healthy"
+    if mem_percent >= 90.0:
+        health_status = "warning: critical memory usage (approaching 512MB container limit)"
+    elif mem_percent >= 75.0:
+        health_status = "warning: high memory usage"
+        
+    # Count stored signals in database
+    total_signals = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM signals")
+        total_signals = cursor.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        total_signals = -1
+
+    return {
+        "status": health_status,
+        "memory_used_mb": round(mem_used, 2),
+        "memory_capacity_mb": mem_capacity,
+        "memory_utilisation_percent": f"{round(mem_percent, 1)}%",
+        "sqlite_total_signals": total_signals,
+        "active_threads": threading.active_count(),
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
 @app.post("/webhook", status_code=status.HTTP_201_CREATED)
 def receive_webhook(payload: SignalPayload, auth: str = Depends(verify_api_key)):
-    """
-    Webhook endpoint hit by our Python scanner.
-    Saves the full detailed signal including zones and historical candles.
-    Avoids duplicate entries by checking if the signal was already logged.
-    """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Deduplication check: verify if we already logged this pattern at this bar_time
+        # Deduplication Guard
         cursor.execute("""
             SELECT id FROM signals 
-            WHERE symbol = ? AND tf = ? AND bar_time = ? AND pattern = ?
-        """, (payload.symbol, payload.tf, payload.bar_time, payload.pattern))
+            WHERE symbol = ? AND tf = ? AND pattern = ? AND bar_time = ?
+        """, (payload.symbol, payload.tf, payload.pattern, payload.bar_time))
         
-        existing = cursor.fetchone()
-        if existing:
+        if cursor.fetchone():
             conn.close()
-            return {"success": True, "message": f"Signal already logged for {payload.symbol} {payload.tf} at {payload.bar_time}. Skipping duplicate."}
+            return {"success": True, "message": "Duplicate signal ignored."}
             
         cursor.execute("""
             INSERT INTO signals (
@@ -195,24 +256,18 @@ def receive_webhook(payload: SignalPayload, auth: str = Depends(verify_api_key))
             json.dumps([c.dict() for c in payload.chart_candles]),
             datetime.utcnow().isoformat() + "Z"
         ))
-        
         conn.commit()
         conn.close()
-        return {"success": True, "message": f"Signal received and logged for {payload.symbol} {payload.tf}."}
+        return {"success": True, "message": f"Signal received for {payload.symbol} {payload.tf}."}
     except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"Database write error: {ex}")
+        raise HTTPException(status_code=500, detail=f"Database error: {ex}")
 
 @app.get("/api/signals")
 def get_signals(limit: int = 50):
-    """
-    Returns a list of recent signals. 
-    To save mobile internet bandwidth, we EXCLUDE the massive 'chart_candles' list in this index view!
-    """
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
         cursor.execute("""
             SELECT id, symbol, tf, pattern, dir, bar_time, open, high, low, close,
                    entry1, entry2, sl, tp1, tp2, tp1_swing, tp2_swing, confidence, reasons, parent_id, created_at
@@ -220,51 +275,52 @@ def get_signals(limit: int = 50):
             ORDER BY id DESC
             LIMIT ?
         """, (limit,))
-        
         rows = cursor.fetchall()
         conn.close()
-        
-        signals = []
-        for r in rows:
-            signals.append(dict(r))
-            
-        return signals
+        return [dict(r) for r in rows]
     except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"Database read error: {ex}")
+        raise HTTPException(status_code=500, detail=f"Database error: {ex}")
 
 @app.get("/api/signals/{signal_id}")
 def get_signal_details(signal_id: int):
-    """
-    Returns the complete detailed signal for a single trade.
-    Includes the 'chart_candles' array and the coordinates of the risk-reward 'zones' 
-    to draw our MT5-grade candlestick charts instantly.
-    """
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
         cursor.execute("SELECT * FROM signals WHERE id = ?", (signal_id,))
         row = cursor.fetchone()
         conn.close()
-        
         if not row:
             raise HTTPException(status_code=404, detail="Signal not found.")
-            
         data = dict(row)
-        # Parse the JSON columns back into native lists/dicts
         data["zones"] = json.loads(data["zones"])
         data["chart_candles"] = json.loads(data["chart_candles"])
-        
         return data
     except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"Database detailed read error: {ex}")
+        raise HTTPException(status_code=500, detail=f"Database error: {ex}")
 
 # =====================================================================
-# WEB SERVER IGNITION (Uvicorn)
+# BACKGROUND THREAD IGNITION (Runs scanner in parallel)
 # =====================================================================
+def start_background_scanner():
+    """
+    Spawns main.py's scanning loop inside a background daemon thread.
+    This runs continuously in parallel with the FastAPI server.
+    """
+    print("\n⚡ [FREE TIER ENGINE] Spawning background market scanner thread... ⚡")
+    try:
+        import main
+        # Run main loop as a separate daemon thread so it doesn't block the API
+        scanner_thread = threading.Thread(target=main.main, daemon=True)
+        scanner_thread.start()
+        print("⚡ [FREE TIER ENGINE] Scanner thread successfully initialized and running! ⚡\n")
+    except Exception as ex:
+        print(f"❌ [FREE TIER ENGINE ERROR] Failed to start scanner background thread: {ex}")
+
+@app.on_event("startup")
+def on_startup():
+    start_background_scanner()
+
 if __name__ == "__main__":
-    # To run locally: python app_api.py
-    # Runs on port 8000 by default. Works perfectly on Render free tier.
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app_api:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app_api:app", host="0.0.0.0", port=port, reload=False)
