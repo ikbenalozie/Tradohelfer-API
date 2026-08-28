@@ -10,7 +10,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends, status
+from fastapi import FastAPI, HTTPException, Header, Depends, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -256,7 +256,7 @@ def get_health():
     }
 
 @app.post("/webhook", status_code=status.HTTP_201_CREATED)
-def receive_webhook(payload: Any, auth: str = Depends(verify_api_key)):
+def receive_webhook(payload: dict = Body(...), auth: str = Depends(verify_api_key)):
     """
     Dual-mode Webhook Endpoint:
     Seamlessly parses single signals OR bundled high-speed batches inside a single atomic SQLite transaction!
