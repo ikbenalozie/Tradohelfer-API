@@ -38,7 +38,7 @@ EXPECTED_API_KEY = "Ikealoben_2025bijna"
 # =====================================================================
 # ONESIGNAL PUSH NOTIFICATION DISPATCHER (0-dependency Server Integration)
 # =====================================================================
-def trigger_push_notification(title: str, body: str, signal_id: Optional[int] = None):
+def trigger_push_notification(title: str, body: str, signal_id: Optional[int] = None, tf: Optional[str] = None, confidence: Optional[str] = None):
     """
     Fires a high-priority push notification to all Android subscribers via OneSignal REST API.
     Does not block request execution threads by running in an isolated safety-try context.
@@ -65,10 +65,20 @@ def trigger_push_notification(title: str, body: str, signal_id: Optional[int] = 
         "app_id": app_id,
         "headings": {"en": title},
         "contents": {"en": body},
-        "included_segments": ["All"], # Direct broadcast to all installed devices
         "priority": 10,               # High priority delivery to bypass Android sleep/doze locks
         "data": data_payload
     }
+    
+    # Dynamic Server-Side Tag Filters
+    if tf and confidence:
+        tf_tag = f"tf_{tf.upper()}"
+        conf_tag = f"conf_{confidence.lower()}"
+        payload["filters"] = [
+            {"field": "tag", "key": tf_tag, "relation": "=", "value": "true"},
+            {"field": "tag", "key": conf_tag, "relation": "=", "value": "true"}
+        ]
+    else:
+        payload["included_segments"] = ["All"]
     
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=8)
@@ -337,15 +347,32 @@ def receive_webhook(payload: dict = Body(...), auth: str = Depends(verify_api_ke
             
             # Send high-priority batch notification if new setups were recorded
             if added_count > 0:
-                summary_text = ", ".join(push_summary_elements)
-                if added_count > 3:
-                    summary_text += f", and {added_count - 3} more"
-                
-                trigger_push_notification(
-                    title=f"🚨 {added_count} New Trading Setups Detected!",
-                    body=f"Target setups closed on chart bounds: {summary_text}.",
-                    signal_id=latest_signal_id
-                )
+                if added_count <= 5:
+                    # Live Scan Mode: Send individual targeted notifications for each signal
+                    for raw_sig in signals_list:
+                        try:
+                            title = f"🚨 New setup: {raw_sig['symbol']} {raw_sig['tf']} ({raw_sig['dir']})!"
+                            body = f"Pattern: {raw_sig['pattern'].upper()} | Confidence: {raw_sig['confidence'].upper()} | Entry: {raw_sig['entry1']}"
+                            trigger_push_notification(
+                                title=title,
+                                body=body,
+                                signal_id=latest_signal_id,
+                                tf=raw_sig.get('tf'),
+                                confidence=raw_sig.get('confidence')
+                            )
+                        except Exception as e:
+                            print(f"[ONESIGNAL BATCH FILTER ERROR] {e}")
+                else:
+                    # Massive backfill sync: Send one summary notification to avoid spamming the phone!
+                    summary_text = ", ".join(push_summary_elements)
+                    if added_count > 3:
+                        summary_text += f", and {added_count - 3} more"
+                    
+                    trigger_push_notification(
+                        title=f"🚨 {added_count} New Trading Setups Detected!",
+                        body=f"Target setups closed on chart bounds: {summary_text}.",
+                        signal_id=latest_signal_id
+                    )
                 
             return {"success": True, "message": f"Processed batch of {count} signals. Committed {added_count} new entries."}
             
@@ -400,7 +427,9 @@ def receive_webhook(payload: dict = Body(...), auth: str = Depends(verify_api_ke
             trigger_push_notification(
                 title=f"🚨 New setup: {raw_sig['symbol']} {raw_sig['tf']} ({raw_sig['dir']})!",
                 body=f"Pattern: {raw_sig['pattern'].upper()} | Confidence: {raw_sig['confidence'].upper()} | Entry: {raw_sig['entry1']}",
-                signal_id=new_id
+                signal_id=new_id,
+                tf=raw_sig.get('tf'),
+                confidence=raw_sig.get('confidence')
             )
             
             return {"success": True, "message": f"Signal received and logged for {raw_sig['symbol']} {raw_sig['tf']}."}
