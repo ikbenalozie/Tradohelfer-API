@@ -409,7 +409,7 @@ def receive_webhook(payload: dict = Body(...), auth: str = Depends(verify_api_ke
         raise HTTPException(status_code=500, detail=f"Database execution error: {ex}")
 
 @app.get("/api/signals")
-def get_signals(limit: int = 50):
+def get_signals(limit: int = 150):
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
